@@ -7,161 +7,105 @@ import datetime
 import yaml
 import time
 import os, sys
-fpath = os.path.abspath(os.path.join(os.path.dirname(__file__),"access_config"))
-sys.path.append(fpath)
+from pathlib import Path
 import psycopg2
 from config import config
 import pandas as pd 
 # Reading config from yaml file
 
-def database_cleanup():
-    logging.info("Cleaning the database with older data")
-    
-    params = config()
-    connection = psycopg2.connect(**params)
-    connection.autocommit = True
+def setup_logging() -> None:
+    """Configure logging with proper format and file handler."""
+    today = datetime.date.today()
+    log_file = Path(__file__).parent.parent / "logs" / f"run_{today}.log"
+    logging.basicConfig(
+        filename=log_file,
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
 
-    cursor = connection.cursor()
-    date_time_now = datetime.datetime.now()
-    date_time_del = date_time_now - datetime.timedelta(days=4)
-    date_time_del = date_time_del.strftime("%Y-%m-%d %H:%M:%S")
-    query = f"DELETE FROM banknifty_option_data where date_time <= \'{(date_time_del)}\'"
-    cursor.execute(query)
-    
-def gen_tokens():
-    
-# Generating Access Tokens
-    logging.info("Generating day account access and instrument tokens")
-    path = os.path.abspath(os.path.join(os.path.dirname(__file__), "access_config"))
-
-    os.system('cd "'+ path +'" && python generate_access_token.py')
-    # # Generating instrument tokens
-    print("Generating Instrument tokens")
-    os.system('cd "'+ path +'" && python generate_banknifty_tokens.py')
-
-
-def celery_websocket():
-
-    # Reading config from file
-    config_path = os.path.abspath(os.path.join(os.path.dirname(__file__),"..","config.yml"))
-    try: 
-        with open (config_path, 'r') as file:
-            config = yaml.safe_load(file)
+def load_config() -> dict:
+    """Load configuration from YAML file."""
+    config_path = Path(__file__).parent.parent / "config.yml"
+    try:
+        with open(config_path, 'r') as file:
+            return yaml.safe_load(file)
     except Exception as e:
-        print('Error reading the config file')
+        logging.error(f"Error reading config file: {e}")
+        raise
 
-    logging.info('Deleting queues from rabbitmq')
-    rabbitmq_del_queue = './rabbitmqadmin -f tsv -q list queues name | while read queue; do ./rabbitmqadmin -q delete queue name=${queue}; done'
-    # rabbitmq_del_queue = 'python.exe rabbitmqadmin -f tsv -q list queues name | while read queue; do python.exe rabbitmqadmin -q delete queue name=banknifty; done'
+def cleanup_database(config: dict, days: int = 4) -> None:
+    """Remove data older than specified days from the database."""
+    logging.info("Cleaning the database with older data")
+    deletion_date = datetime.datetime.now() - datetime.timedelta(days=days)
+    query = "DELETE FROM banknifty_option_data WHERE date_time <= %s"
+
+    with psycopg2.connect(**config) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(query, (deletion_date.strftime("%Y-%m-%d %H:%M:%S"),))
+
+def generate_tokens() -> None:
+    """Generate access and instrument tokens."""
+    logging.info("Generating access tokens and instrument tokens")
+    access_config_path = Path(__file__).parent / "access_config"
+
+    # Generate access tokens
+    os.system(f'cd "{access_config_path}" && python generate_access_token.py')
     
-    os.system(rabbitmq_del_queue)
+    # Generate instrument tokens
+    logging.info("Generating instrument tokens")
+    os.system(f'cd "{access_config_path}" && python generate_banknifty_tokens.py')
 
-    logging.info("Collecting Data")
-# Class mythread inheriting thread class
-    class myThread (threading.Thread):
-        def __init__(self, command):
-            threading.Thread.__init__(self)
-            self.cmd = command
+def manage_celery_websocket(config: dict) -> None:
+    """Manage Celery workers and websocket connections."""
+    logging.info('Deleting queues from RabbitMQ')
+    os.system('./rabbitmqadmin -f tsv -q list queues name | while read queue; do ./rabbitmqadmin -q delete queue name=${queue}; done')
 
-        def run(self):
-            print ("Starting " + self.cmd)
-            os.system(self.cmd)
-            print ("Exiting " + self.cmd)
-
-    worker = os.path.abspath(os.path.join(os.path.dirname(__file__), "publish_database"))
-    ticker_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "ticker"))
-    flask_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "flask_app"))
+    # Setup paths
+    paths = {
+        'worker': Path(__file__).parent / "publish_database",
+        'ticker': Path(__file__).parent / "ticker",
+        'flask': Path(__file__).parent / "flask_app"
+    }
     
+    queue_name = config['rabbitmq']['queues']['banknifty']
     
-    queue_1 = config['rabbitmq']['queues']['banknifty']
+    commands = [
+        f'cd "{paths["worker"]}" && celery -A insert_database worker -Q {queue_name} --concurrency=1 --loglevel=info -P eventlet -n worker1@%h',
+        f'cd "{paths["ticker"]}" && python banknifty_conn.py',
+        f'cd "{paths["flask"]}" && python app.py'
+    ]
     
-    # Commands to run parallely
-    lstCmd=['cd "' + worker + f'" && celery -A insert_database  worker -Q {queue_1} --concurrency=1  --loglevel=info -P  eventlet -n worker1@%h', 
-            'cd "' + ticker_path +'" && python banknifty_conn.py',
-            'cd "' + flask_path +'" && python app.py']   
+    threads = [threading.Thread(target=os.system, args=(cmd,)) for cmd in commands]
+    for thread in threads:
+        thread.start()
+    
+    for thread in threads:
+        thread.join()
 
-    # Create new threads
-    thread1 = myThread(lstCmd[0])
-    thread2 = myThread(lstCmd[1])
-    thread3 = myThread(lstCmd[2])
-    
-    
+def main() -> None:
+    """Main execution function."""
+    setup_logging()
+    today = datetime.date.today()
+    logging.info(f'Starting run for date: {today}')
 
-    threads = [thread1,thread2, thread3]
+    exec_date_file = Path("/home/narayana_tariq/Zerodha/Supertrend/last_execution_date.txt")
+    config = load_config()
 
-    # Start new Threads
-    thread1.start()
-    thread2.start()
-    thread3.start()
-    
-    while True:
-        time.sleep(2)
-        time_string = "15:30:00"
-        time_now = datetime.datetime.now().time()
-        exit_time = datetime.datetime.strptime(time_string,"%H:%M:%S").time()
-        for i in range(len(threads)):
-            if threads[i].is_alive():
-                # print('is alive')
-                # logging.info('is alive')
-                
-                continue
-                
-            else:
-                # The currency data is collected using conn_1 so it runs till 17:00
-                if(time_now < exit_time ):
+    try:
+        last_exec_date = exec_date_file.read_text().strip()
+    except FileNotFoundError:
+        last_exec_date = ''
 
-                    logging.info('Time:%s',time_now)
-                    logging.info('Thread died: %s',lstCmd[i])
-                    new_thread = myThread(lstCmd[i])
-                    new_thread.start()
-                    threads[i] = new_thread
-                    logging.info('Thread restarted')
-                    
-        if(time_now.hour == 15 and time_now.minute == 30):
-            logging.info('Run over')
-            break
-  
+    if not last_exec_date:
+        cleanup_database(config)
+        generate_tokens()
+    else:
+        last_date = datetime.datetime.strptime(last_exec_date, "%Y-%m-%d").date()
+        if last_date != today:
+            generate_tokens()
+
+    manage_celery_websocket(config)
 
 if __name__ == "__main__":
-    
-
-    date = datetime.date.today()
-    log_file = os.path.abspath(os.path.join(os.path.dirname(__file__), "..",f"logs/run_{date}.log"))
-    logging.basicConfig(filename=log_file, level=logging.INFO)
-
-    time_now = datetime.datetime.now()
-    logging.info('Today date is %s',date)
-    logging.info('Started run at %s',time_now)
-    
-    exec_date_file = "/home/narayana_tariq/Zerodha/Supertrend/last_execution_date.txt"
-
-    print(date)
-    with open(exec_date_file, 'a+') as infile:
-        try:
-            # prev = json.load(infile)
-           infile.seek(0)
-           a = infile.readline()
-           print(a)
-        except JSONDecodeError:
-            print("exception")
-            pass
-    
-       
-    
-    if(a == ''):
-        database_cleanup()
-        
-        gen_tokens()
-        celery_websocket()
-        
-    else:
-        date_exec = datetime.datetime.strptime(a, "%Y-%m-%d")
-        
-        if(date_exec.date() == date):
-            celery_websocket()
-
-        else:
-            gen_tokens()
-            celery_websocket()
-    
+    main()
     
